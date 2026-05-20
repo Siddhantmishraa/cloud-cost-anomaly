@@ -17,7 +17,7 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cloud-cost-anomaly-detection.git
+git clone https://github.com/Siddhantmishraa/cloud-cost-anomaly.git
 cd cloud-cost-anomaly-detection
 pip install -r requirements.txt
 python main.py                          # Run full pipeline

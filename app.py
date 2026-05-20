@@ -395,7 +395,7 @@ app.layout = dbc.Container([
         html.Span("Built with Plotly Dash · scikit-learn · statsmodels · Deployed on Render.com",
             style={"fontSize": "11px", "color": COLORS["subtext"]}),
         html.Br(),
-        html.Span("AI-Driven Cloud Cost Anomaly Detection System · 2024",
+        html.Span("AI-Driven Cloud Cost Anomaly Detection System",
             style={"fontSize": "11px", "color": COLORS["subtext"]}),
     ], style={"textAlign": "center", "padding": "16px", "borderTop": f"1px solid {COLORS['teal']}20"}),
 
