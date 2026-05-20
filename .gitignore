@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+.env
+data/simulated/
+models/*.pkl
+reports/*.pdf
+reports/alert_log.json
+reports/pipeline_results.json
+node_modules/
+.DS_Store
+*.egg-info/
+dist/
+build/

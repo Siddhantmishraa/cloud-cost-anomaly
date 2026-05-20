@@ -1,0 +1,21 @@
+{
+  "precision": 1.0,
+  "recall": 0.6923,
+  "f1_score": 0.8182,
+  "auc_roc": 0.9092,
+  "true_positives": 9,
+  "false_positives": 0,
+  "true_negatives": 233,
+  "false_negatives": 4,
+  "false_positive_rate": 0.0,
+  "false_negative_rate": 0.3077,
+  "total_anomalies_detected": 9,
+  "total_actual_anomalies": 13,
+  "confidence_level": 0.95,
+  "sigma_threshold": 2.5,
+  "arima_order": "(2, 1, 2)",
+  "seasonal_order": "(1, 0, 1, 7)",
+  "AWS_aic": 5980.58,
+  "Azure_aic": 6198.69,
+  "GCP_aic": 6300.86
+}

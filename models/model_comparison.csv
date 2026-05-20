@@ -1,0 +1,4 @@
+Model,Precision,Recall,F1 Score,AUC-ROC,True Pos,False Pos,False Neg,FP Rate,FN Rate
+Isolation Forest,0.2973,0.8462,0.44,0.966,11,26,2,0.1116,0.1538
+ARIMA,1.0,0.6923,0.8182,0.9092,9,0,4,0.0,0.3077
+Ensemble,1.0,0.7692,0.8696,0.9643,10,0,3,0.0,0.2308
