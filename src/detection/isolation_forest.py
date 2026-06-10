@@ -61,7 +61,15 @@ class IsolationForestDetector:
                 n_jobs        = -1,
             )
             model.fit(X)
-            self.models[provider] = {"model": model, "feature_cols": feat_cols}
+            # Score range from TRAINING data only, so test-set scores don't
+            # depend on other test-set values (no leakage)
+            train_scores = model.score_samples(X)
+            self.models[provider] = {
+                "model": model,
+                "feature_cols": feat_cols,
+                "score_min": float(train_scores.min()),
+                "score_max": float(train_scores.max()),
+            }
             print(f"    {provider}: trained on {len(prov_data):,} records "
                   f"({len(feat_cols)} features)")
 
@@ -89,23 +97,25 @@ class IsolationForestDetector:
             raw_score = artefact["model"].score_samples(X)  # more negative = more anomalous
 
             df.loc[mask, "if_prediction"] = (raw_pred == -1).astype(int)
-            # Normalize score to 0-1 (higher = more anomalous)
-            score_min, score_max = raw_score.min(), raw_score.max()
+            # Normalize to 0-1 using the TRAINING score range (higher = more
+            # anomalous). Test scores beyond the training range clip to 0/1.
+            score_min = artefact["score_min"]
+            score_max = artefact["score_max"]
             norm_score = 1 - (raw_score - score_min) / (score_max - score_min + 1e-9)
-            df.loc[mask, "if_score"] = norm_score
+            df.loc[mask, "if_score"] = np.clip(norm_score, 0.0, 1.0)
 
         df["if_confidence"] = df["if_score"]
         return df
 
-    def evaluate(self, test_df: pd.DataFrame, predicted_df: pd.DataFrame) -> dict:
-        """Compute full evaluation metrics against ground truth."""
-        y_true = test_df["has_anomaly"].astype(int).values
-        y_pred = predicted_df["if_prediction"].values
+    def evaluate(self, predicted_df: pd.DataFrame) -> dict:
+        """
+        Compute full evaluation metrics against ground truth.
+        predict() copies its input, so the ground-truth label travels on the
+        same row as the prediction — no positional alignment needed.
+        """
+        y_true  = predicted_df["has_anomaly"].astype(int).values
+        y_pred  = predicted_df["if_prediction"].values
         y_score = predicted_df["if_score"].values
-
-        # Align by index
-        min_len = min(len(y_true), len(y_pred))
-        y_true, y_pred, y_score = y_true[:min_len], y_pred[:min_len], y_score[:min_len]
 
         cm = confusion_matrix(y_true, y_pred)
         tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
@@ -152,7 +162,7 @@ class IsolationForestDetector:
 
         self.train(train_df)
         predicted = self.predict(test_df)
-        metrics   = self.evaluate(test_df, predicted)
+        metrics   = self.evaluate(predicted)
         self.save()
 
         print(f"\n  Results:")
