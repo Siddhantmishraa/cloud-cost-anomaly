@@ -4,17 +4,22 @@ Plotly Dash application served via Gunicorn on Render.com
 """
 
 import os
+import io
 import json
+import base64
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from dash import Dash, dcc, html, Input, Output, callback
+from dash import Dash, dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
+
+from src.ingestion.adapters import normalize_billing_export
+from src.byoe_pipeline      import analyze_billing_data
 
 # ── Bootstrap theme ───────────────────────────────────────────
 app = Dash(
@@ -247,6 +252,135 @@ def _make_metrics_col(name, m, color):
     ])
 
 
+# ── Bring-Your-Own-Export mode ─────────────────────────────────
+def fig_byoe_trends(preds):
+    """Detection-window chart: actual vs forecast with flagged days."""
+    fig = go.Figure()
+    for prov in sorted(preds["provider"].unique()):
+        p   = preds[preds["provider"] == prov].sort_values("date")
+        col = PROVIDER_COLORS.get(prov, COLORS["teal"])
+        fig.add_trace(go.Scatter(x=p["date"], y=p["total_cost"], name=f"{prov} actual",
+            line=dict(color=col, width=1.6)))
+        if "arima_forecast" in p.columns:
+            fig.add_trace(go.Scatter(x=p["date"], y=p["arima_forecast"],
+                name=f"{prov} forecast", line=dict(color=col, dash="dot", width=1), opacity=0.55))
+        flagged = p[p["ensemble_prediction"] == 1]
+        if len(flagged):
+            fig.add_trace(go.Scatter(x=flagged["date"], y=flagged["total_cost"], mode="markers",
+                marker=dict(color=COLORS["red"], size=10, symbol="triangle-up",
+                            line=dict(width=1, color="white")),
+                name=f"{prov} anomaly"))
+    fig.update_layout(**PLOTLY_LAYOUT, xaxis=AXIS_STYLE,
+        yaxis=dict(tickformat="$,.0f", gridcolor="rgba(255,255,255,0.07)"),
+        legend=LEGEND_STYLE, height=380,
+        title=dict(text="Your Data — Detection Window (actual vs forecast)",
+                   font=dict(size=14, color=COLORS["text"])))
+    return fig
+
+
+def _byoe_error_card(message):
+    return dbc.Alert([
+        html.Strong("Could not analyze this file. "),
+        html.Span(message, style={"fontSize": "13px"}),
+    ], color="danger", style={"marginTop": "12px"})
+
+
+def render_byoe_results(results, info):
+    s = results["summary"]
+    findings = results["findings"]
+
+    finding_cards = []
+    for f in findings:
+        driver_items = [
+            html.Li(
+                f"{d['service']} ({d['region']}): +${d['excess_usd']:,.0f} "
+                f"({d['pct_above_baseline']:+.0f}% vs baseline · "
+                f"{d['share_of_excess_pct']:.0f}% of excess)",
+                style={"fontSize": "12px", "color": COLORS["text"]},
+            ) for d in f["root_causes"]
+        ]
+        finding_cards.append(dbc.Card([dbc.CardBody([
+            html.Div([
+                severity_badge(f["severity"].upper()),
+                html.Span(f" {f['provider']} · {f['date']}",
+                    style={"fontWeight": "600", "color": COLORS["text"], "marginLeft": "8px"}),
+                html.Span(f"score {f['ensemble_score']:.2f}",
+                    style={"float": "right", "color": COLORS["teal"], "fontSize": "12px"}),
+            ]),
+            html.Div(
+                f"${f['actual_cost']:,.0f} actual vs ${f['forecast_cost']:,.0f} forecast "
+                f"({f['pct_above_forecast']:+.0f}%)",
+                style={"fontSize": "13px", "color": COLORS["subtext"], "margin": "6px 0"}),
+            html.Ul(driver_items, style={"marginBottom": "0", "paddingLeft": "20px"})
+            if driver_items else
+            html.Div("No single service stands out above baseline.",
+                     style={"fontSize": "12px", "color": COLORS["subtext"]}),
+        ], style={"padding": "12px 16px"})],
+        style={"background": COLORS["bg"], "border": f"1px solid {COLORS['red']}30",
+               "borderRadius": "8px", "marginBottom": "8px"}))
+
+    provider_label = (", ".join(info["provider"]) if isinstance(info["provider"], list)
+                      else info["provider"])
+    return html.Div([
+        dbc.Alert([
+            html.Strong(f"✓ Parsed as {info['format'].replace('_', ' ')} export — "),
+            html.Span(f"{provider_label} · {info['days']} days · {info['services']} services · "
+                      f"${info['total_cost']:,.0f} total", style={"fontSize": "13px"}),
+        ], color="success", style={"marginTop": "12px", "marginBottom": "12px"}),
+        dbc.Row([
+            dbc.Col(kpi_card(str(s["days_analyzed"]), "Days analyzed", COLORS["teal"], "📅"), md=3),
+            dbc.Col(kpi_card(str(s["anomaly_days"]), "Anomaly days found", COLORS["red"], "🚨"), md=3),
+            dbc.Col(kpi_card(f"${s['total_excess_usd']:,.0f}", "Excess spend flagged", COLORS["amber"], "💸"), md=3),
+            dbc.Col(kpi_card(str(s["training_days"]), "Days used as baseline", COLORS["green"], "📚"), md=3),
+        ], className="g-3", style={"marginBottom": "12px"}),
+        dcc.Graph(figure=fig_byoe_trends(results["predictions"]),
+                  config={"displayModeBar": False}),
+        html.Div([
+            html.Div(f"🔍 Findings ({len(findings)})", style={"fontSize": "14px",
+                "fontWeight": "500", "color": COLORS["text"], "margin": "12px 0 8px"}),
+            *finding_cards,
+        ]) if findings else html.Div("✅ No anomalies detected in the most recent window.",
+            style={"color": COLORS["green"], "padding": "12px 0", "fontSize": "14px"}),
+    ])
+
+
+byoe_section = dbc.Row([dbc.Col([
+    dbc.Card([
+        html.Div([
+            html.Span("📤 Analyze Your Own Billing Export",
+                style={"fontSize": "14px", "fontWeight": "500", "color": COLORS["text"]}),
+            html.Span("AWS Cost & Usage Report · GCP billing export · Azure cost analysis · generic CSV",
+                style={"fontSize": "11px", "color": COLORS["subtext"], "marginLeft": "12px"}),
+        ], style={"padding": "12px 16px", "borderBottom": f"1px solid {COLORS['teal']}20"}),
+        html.Div([
+            html.Div("Download a billing CSV from your cloud console and drop it here. "
+                     "Everything runs in this app — your data is not stored. "
+                     "Needs at least 60 days of history.",
+                style={"fontSize": "12px", "color": COLORS["subtext"], "marginBottom": "10px"}),
+            dcc.Upload(
+                id="byoe-upload",
+                children=html.Div(["Drag & drop or ", html.A("select a CSV file",
+                    style={"color": COLORS["teal"], "textDecoration": "underline"})]),
+                style={"width": "100%", "height": "64px", "lineHeight": "64px",
+                       "borderWidth": "1.5px", "borderStyle": "dashed",
+                       "borderColor": f"{COLORS['teal']}60", "borderRadius": "10px",
+                       "textAlign": "center", "color": COLORS["subtext"],
+                       "cursor": "pointer", "background": f"{COLORS['teal']}08"},
+                multiple=False,
+                max_size=30 * 1024 * 1024,
+            ),
+            html.Div([
+                dbc.Button("⬇ Try it with a sample export", id="byoe-sample-btn",
+                    size="sm", outline=True, color="info", style={"marginTop": "10px"}),
+                dcc.Download(id="byoe-sample-dl"),
+            ]),
+            dcc.Loading(html.Div(id="byoe-results"), type="dot", color=COLORS["teal"]),
+        ], style={"padding": "16px"}),
+    ], style={"background": COLORS["card"], "border": f"1px solid {COLORS['teal']}25",
+              "borderRadius": "12px"}),
+])])
+
+
 # ── Layout ─────────────────────────────────────────────────────
 em  = metrics.get("ensemble_metrics", {})
 total_cost = daily["total_cost"].sum() if daily is not None else 0
@@ -282,6 +416,11 @@ app.layout = dbc.Container([
         dbc.Col(kpi_card(f"{em.get('f1_score',0):.3f}", "Ensemble F1 score",  COLORS["green"], "🎯"), md=3),
         dbc.Col(kpi_card("0",                          "False positives",       COLORS["red"],   "✅"), md=3),
     ], className="g-3"),
+
+    html.Br(),
+
+    # ── Bring-your-own-export mode ────────────────────────────────
+    byoe_section,
 
     html.Br(),
 
@@ -407,6 +546,49 @@ app.layout = dbc.Container([
 @callback(Output("spending-trends", "figure"), Input("provider-filter", "value"))
 def update_trends(prov):
     return fig_spending_trends(prov)
+
+
+# ── Callback: analyze uploaded billing export ─────────────────
+@callback(
+    Output("byoe-results", "children"),
+    Input("byoe-upload", "contents"),
+    State("byoe-upload", "filename"),
+    prevent_initial_call=True,
+)
+def analyze_upload(contents, filename):
+    if not contents:
+        return no_update
+    try:
+        _, b64 = contents.split(",", 1)
+        decoded = base64.b64decode(b64)
+        df = pd.read_csv(io.BytesIO(decoded))
+    except Exception:
+        return _byoe_error_card(f"'{filename}' is not a readable CSV file.")
+
+    try:
+        normalized, info = normalize_billing_export(df)
+        results = analyze_billing_data(normalized)
+        return render_byoe_results(results, info)
+    except ValueError as e:
+        return _byoe_error_card(str(e))
+    except Exception as e:
+        return _byoe_error_card(f"Analysis failed: {e}")
+
+
+# ── Callback: download a sample export to try the flow ────────
+@callback(
+    Output("byoe-sample-dl", "data"),
+    Input("byoe-sample-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def download_sample(n_clicks):
+    if raw is None:
+        return no_update
+    sample = raw.rename(columns={
+        "provider": "Cloud Vendor", "service": "Product Name",
+        "region": "Location", "cost": "Cost Amount",
+    })[["date", "Cloud Vendor", "Product Name", "Location", "Cost Amount"]]
+    return dcc.send_data_frame(sample.to_csv, "sample_billing_export.csv", index=False)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 """
 ARIMA-based Anomaly Detector for Cloud Billing Time-Series
-Forecasts expected spending and flags deviations outside confidence intervals.
-Uses auto_arima for automatic order selection (p, d, q).
+Fits SARIMA per provider, then runs rolling one-step-ahead forecasts:
+each test day is scored against its forecast before the actual value is
+fed back into the model. Differencing order d is chosen via ADF test.
 """
 
 import numpy as np
@@ -79,6 +80,10 @@ class ARIMADetector:
 
         aic  = round(fitted.aic, 2)
         rmse = round(np.sqrt(np.mean(fitted.resid**2)), 2)
+        # Residual sigma from training only (skip differencing burn-in) —
+        # used to score test days without touching test-set statistics.
+        train_resid_std = float(np.std(fitted.resid.iloc[14:])) if len(fitted.resid) > 28 \
+                          else float(np.std(fitted.resid))
         print(f"    {provider}: {model_type}({self.order[0]},{d},{self.order[2]}) "
               f"| AIC={aic} | Train RMSE={rmse}")
 
@@ -87,6 +92,7 @@ class ARIMADetector:
             "model_type": model_type,
             "aic": aic,
             "train_rmse": rmse,
+            "train_resid_std": train_resid_std,
             "stationarity": stationarity,
         }
 
@@ -104,12 +110,26 @@ class ARIMADetector:
             if result:
                 self.fitted_models[provider] = result
 
-    def forecast_and_detect(self, test_df: pd.DataFrame) -> pd.DataFrame:
+    @staticmethod
+    def _safe_append(fitted, date, value):
+        """Append one observation to a fitted model (Kalman update, no refit)."""
+        try:
+            new_obs = pd.Series([value], index=pd.DatetimeIndex([date]))
+            return fitted.append(new_obs, refit=False)
+        except Exception:
+            return fitted
+
+    def forecast_and_detect(self, test_df: pd.DataFrame,
+                            warmup_df: pd.DataFrame = None) -> pd.DataFrame:
         """
-        Generate forecasts for test period and detect anomalies via
-        confidence interval violations.
+        Rolling one-step-ahead detection: forecast each day, score it, then
+        append the actual observation before forecasting the next day.
+        No future information enters either the forecast or the score.
+        `warmup_df` (e.g. the validation period) bridges the gap between the
+        end of training and the start of the test window.
         """
         all_predictions = []
+        alpha = 1 - self.confidence_level
 
         for provider, artefact in self.fitted_models.items():
             prov_test = test_df[test_df["provider"] == provider].copy()
@@ -118,44 +138,55 @@ class ARIMADetector:
             if len(prov_test) == 0:
                 continue
 
-            fitted  = artefact["fitted"]
-            n_steps = len(prov_test)
+            fitted          = artefact["fitted"]
+            train_resid_std = artefact["train_resid_std"] + 1e-9
 
-            try:
-                # Rolling one-step-ahead forecast
-                forecast_obj = fitted.get_forecast(steps=n_steps)
-                forecast_mean = forecast_obj.predicted_mean.values
-                forecast_ci   = forecast_obj.conf_int(alpha=1 - self.confidence_level)
-                upper_ci      = forecast_ci.iloc[:, 1].values
-                lower_ci      = forecast_ci.iloc[:, 0].values
-            except Exception:
-                # Fallback: use residual std for CI
-                resid_std    = np.std(fitted.resid)
-                last_val     = fitted.fittedvalues.iloc[-1]
-                forecast_mean = np.full(n_steps, last_val)
-                upper_ci     = forecast_mean + self.sigma_threshold * resid_std
-                lower_ci     = forecast_mean - self.sigma_threshold * resid_std
+            # Walk the model through the unscored gap period
+            if warmup_df is not None:
+                warm = warmup_df[warmup_df["provider"] == provider].sort_values("date")
+                for _, row in warm.iterrows():
+                    fitted = self._safe_append(fitted, row["date"], row["total_cost"])
 
-            actuals   = prov_test["total_cost"].values
-            residuals = actuals - forecast_mean[:len(actuals)]
-            resid_std = np.std(residuals) + 1e-9
+            means, uppers, lowers = [], [], []
+            for _, row in prov_test.iterrows():
+                try:
+                    fc       = fitted.get_forecast(steps=1)
+                    mean_val = float(fc.predicted_mean.iloc[0])
+                    ci       = fc.conf_int(alpha=alpha)
+                    lo, hi   = float(ci.iloc[0, 0]), float(ci.iloc[0, 1])
+                except Exception:
+                    mean_val = float(fitted.fittedvalues.iloc[-1])
+                    hi = mean_val + self.sigma_threshold * train_resid_std
+                    lo = mean_val - self.sigma_threshold * train_resid_std
+                means.append(mean_val)
+                uppers.append(hi)
+                lowers.append(lo)
+                # Feed today's actual into the model before forecasting tomorrow
+                fitted = self._safe_append(fitted, row["date"], row["total_cost"])
 
-            # Anomaly: actual exceeds upper CI OR deviates > sigma_threshold
+            forecast_mean = np.array(means)
+            upper_ci      = np.array(uppers)
+            lower_ci      = np.array(lowers)
+            actuals       = prov_test["total_cost"].values
+            residuals     = actuals - forecast_mean
+
+            # Anomaly: actual exceeds one-step CI OR deviates beyond
+            # sigma_threshold training sigmas (no test-set statistics used)
             arima_pred = (
-                (actuals > upper_ci[:len(actuals)]) |
-                (np.abs(residuals) > self.sigma_threshold * resid_std)
+                (actuals > upper_ci) |
+                (np.abs(residuals) > self.sigma_threshold * train_resid_std)
             ).astype(int)
 
-            # Anomaly score: normalized residual magnitude
-            arima_score = np.abs(residuals) / (np.max(np.abs(residuals)) + 1e-9)
+            # Score: residual magnitude in training sigmas, saturating at 4σ
+            arima_score = np.clip(np.abs(residuals) / (4.0 * train_resid_std), 0.0, 1.0)
 
             prov_result = prov_test.copy()
-            prov_result["arima_forecast"]  = forecast_mean[:len(actuals)]
-            prov_result["arima_upper_ci"]  = upper_ci[:len(actuals)]
-            prov_result["arima_lower_ci"]  = lower_ci[:len(actuals)]
-            prov_result["arima_residual"]  = residuals
+            prov_result["arima_forecast"]   = forecast_mean
+            prov_result["arima_upper_ci"]   = upper_ci
+            prov_result["arima_lower_ci"]   = lower_ci
+            prov_result["arima_residual"]   = residuals
             prov_result["arima_prediction"] = arima_pred
-            prov_result["arima_score"]     = arima_score
+            prov_result["arima_score"]      = arima_score
 
             all_predictions.append(prov_result)
 
@@ -205,13 +236,14 @@ class ARIMADetector:
             json.dump(self.results, f, indent=2)
         print(f"  ARIMA metrics saved to {path}")
 
-    def run_full_pipeline(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+    def run_full_pipeline(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                          warmup_df: pd.DataFrame = None) -> dict:
         print("\n" + "=" * 60)
-        print("  ARIMA Detection Pipeline")
+        print("  ARIMA Detection Pipeline (rolling one-step-ahead)")
         print("=" * 60)
 
         self.train(train_df)
-        predicted = self.forecast_and_detect(test_df)
+        predicted = self.forecast_and_detect(test_df, warmup_df=warmup_df)
         metrics   = self.evaluate(predicted)
         self.save_metrics()
 

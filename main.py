@@ -24,6 +24,7 @@ from src.detection.isolation_forest import IsolationForestDetector
 from src.detection.arima_detector   import ARIMADetector
 from src.detection.ensemble         import EnsembleDetector
 from src.alerting.alert_engine      import AlertEngine
+from src.alerting.root_cause        import RootCauseAnalyzer
 
 
 def run_pipeline(
@@ -96,7 +97,10 @@ def run_pipeline(
         seasonal_order=(1, 0, 1, 7),
         sigma_threshold=2.5,
     )
-    arima_results = arima_detector.run_full_pipeline(train_daily, test_daily)
+    # Validation period bridges the gap between train end and test start,
+    # so the rolling forecast walks through it before scoring test days
+    arima_results = arima_detector.run_full_pipeline(train_daily, test_daily,
+                                                     warmup_df=val_daily)
     arima_metrics = arima_results["metrics"]
     arima_preds   = arima_results["predictions"]
 
@@ -137,9 +141,11 @@ def run_pipeline(
     # STEP 6: Alerting
     # ─────────────────────────────────────────────
     print("\n[6/6] Alert engine...")
+    root_cause = RootCauseAnalyzer(raw_df, baseline_window=30, top_n=3)
     alert_engine = AlertEngine(
         cooldown_hours=0,   # no suppression in demo run
         min_severity="low",
+        root_cause_analyzer=root_cause,
     )
     alerts = alert_engine.run(combined)
     alert_summary = alert_engine.generate_alert_summary()

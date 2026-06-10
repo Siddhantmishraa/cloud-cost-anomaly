@@ -47,11 +47,13 @@ class AlertEngine:
                  email_config: dict = None,
                  cooldown_hours: int = 4,
                  min_severity: str = "low",
+                 root_cause_analyzer=None,
                  output_dir: str = "reports"):
         self.slack_webhook   = slack_webhook_url
         self.email_config    = email_config or {}
         self.cooldown_hours  = cooldown_hours
         self.min_severity    = min_severity
+        self.root_cause      = root_cause_analyzer
         self.output_dir      = output_dir
         self._alert_log      = []
         self._last_alerted   = defaultdict(lambda: datetime.min)
@@ -84,6 +86,11 @@ class AlertEngine:
 
             pct_above = ((cost - forecast) / (forecast + 1e-9)) * 100
 
+            # Attribute the spike to the services that drove it
+            root_causes = []
+            if self.root_cause is not None:
+                root_causes = self.root_cause.explain(provider, date_str)
+
             alert = {
                 "id":           f"{provider}_{date_str}_{severity}",
                 "timestamp":    datetime.now().isoformat(),
@@ -94,8 +101,10 @@ class AlertEngine:
                 "actual_cost":  round(float(cost), 2),
                 "forecast_cost": round(float(forecast), 2),
                 "pct_above_forecast": round(float(pct_above), 1),
+                "root_causes":  root_causes,
                 "message":      self._format_message(provider, date_str, severity,
-                                                      cost, forecast, pct_above),
+                                                      cost, forecast, pct_above,
+                                                      root_causes),
                 "suppressed":   self._should_suppress(f"{provider}_{severity}"),
             }
             alerts.append(alert)
@@ -105,14 +114,24 @@ class AlertEngine:
 
         return alerts
 
-    def _format_message(self, provider, date, severity, actual, forecast, pct_above):
+    def _format_message(self, provider, date, severity, actual, forecast,
+                        pct_above, root_causes=None):
         emoji = SEVERITY_EMOJI.get(severity, "⚠️")
-        return (
+        msg = (
             f"{emoji} [{severity.upper()}] Cloud cost anomaly detected\n"
             f"Provider: {provider} | Date: {date}\n"
             f"Actual: ${actual:,.2f} | Forecast: ${forecast:,.2f}\n"
             f"Deviation: +{pct_above:.1f}% above expected"
         )
+        if root_causes:
+            driver_lines = [
+                f"  • {d['service']} ({d['region']}): ${d['actual_cost']:,.0f} "
+                f"vs ${d['baseline_cost']:,.0f} baseline "
+                f"({d['pct_above_baseline']:+.0f}%, {d['share_of_excess_pct']:.0f}% of excess)"
+                for d in root_causes
+            ]
+            msg += "\nTop drivers:\n" + "\n".join(driver_lines)
+        return msg
 
     def dispatch_console(self, alerts: list):
         """Print alerts to console (always enabled)."""
@@ -124,6 +143,10 @@ class AlertEngine:
             print(f"  [{sev_upper}] {a['provider']} {a['date']} | "
                   f"${a['actual_cost']:,.0f} ({a['pct_above_forecast']:+.0f}%) | "
                   f"score={a['ensemble_score']:.2f}")
+            for d in a.get("root_causes", []):
+                print(f"             ↳ {d['service']} ({d['region']}): "
+                      f"+${d['excess_usd']:,.0f} ({d['pct_above_baseline']:+.0f}% vs baseline, "
+                      f"{d['share_of_excess_pct']:.0f}% of excess)")
 
     def dispatch_slack(self, alerts: list):
         """Send alert to Slack via webhook (if configured)."""
